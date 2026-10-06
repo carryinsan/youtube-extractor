@@ -3,10 +3,11 @@ use regex::Regex;
 use reqwest::{redirect::Policy, Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use http_body_util::BodyExt;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
 use url::Url;
-use vercel_runtime::{run, Error, Request};
+use vercel_runtime::{run, service_fn, Error, Request, Response as VercelResponse, ResponseBody};
 
 const MAX_BODY: usize = 6 * 1024 * 1024;
 const MAX_HTML: usize = 4 * 1024 * 1024;
@@ -74,45 +75,53 @@ struct CaptionTrack {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    run(handler).await
+    run(service_fn(handler)).await
 }
 
-async fn handler(req: Request) -> Result<Value, Error> {
+async fn handler(req: Request) -> Result<VercelResponse<ResponseBody>, Error> {
+    if req.method().as_str() == "OPTIONS" {
+        return Ok(VercelResponse::builder()
+            .status(204)
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "POST, OPTIONS")
+            .header("access-control-allow-headers", "content-type")
+            .body(ResponseBody::from(Vec::new()))?);
+    }
     if req.method().as_str() != "POST" {
-        return Ok(json!({"ok": false, "error": {"code": "METHOD_NOT_ALLOWED", "message": "Use POST."}}));
+        return error_response("METHOD_NOT_ALLOWED", "Use POST.");
     }
-    if req.body().len() > 16 * 1024 {
-        return Ok(error_json("REQUEST_TOO_LARGE", "Request body is limited to 16 KB."));
+    let body = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return error_response("READ_FAILED", "Could not read request body."),
+    };
+    if body.len() > 16 * 1024 {
+        return error_response("REQUEST_TOO_LARGE", "Request body is limited to 16 KB.");
     }
-    let input: Input = match serde_json::from_slice(req.body()) {
+    let input: Input = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return Ok(error_json("INVALID_JSON", "Request body must be JSON like {\"url\":\"https://youtu.be/...\"}.")),
+        Err(_) => return error_response("INVALID_JSON", "Request body must be JSON like {\"url\":\"https://youtu.be/...\"}."),
     };
     let id = match extract_video_id(&input.url) {
         Ok(v) => v,
-        Err(msg) => return Ok(error_json("INVALID_YOUTUBE_URL", &msg)),
+        Err(msg) => return error_response("INVALID_YOUTUBE_URL", &msg),
     };
-
     let overall = Instant::now();
     let client = match make_client() {
         Ok(v) => v,
-        Err(e) => return Ok(error_json("CLIENT_INIT_FAILED", &e.to_string())),
+        Err(e) => return error_response("CLIENT_INIT_FAILED", &e.to_string()),
     };
     let lang = input.lang.as_deref().map(str::trim).filter(|s| !s.is_empty());
-
     let mut attempts: Vec<BoxFuture<'static, AttemptResult>> = Vec::with_capacity(4);
     attempts.push(watch_attempt(client.clone(), id.clone(), lang.map(str::to_string)).boxed());
     attempts.push(inner_tube_attempt(client.clone(), id.clone(), lang.map(str::to_string), "ANDROID").boxed());
     attempts.push(inner_tube_attempt(client.clone(), id.clone(), lang.map(str::to_string), "IOS").boxed());
     attempts.push(inner_tube_attempt(client.clone(), id.clone(), lang.map(str::to_string), "TVHTML5").boxed());
-
     let joined = select_ok(attempts);
     let extraction: AttemptResult = match timeout(Duration::from_secs(24), joined).await {
         Ok(Ok((value, _remaining))) => Ok(value),
-        Ok(Err(errors)) => Err(errors.into_iter().next().unwrap_or(AttemptError { label: "all", message: "No transcript path succeeded." })),
-        Err(_) => Err(AttemptError { label: "all", message: "Timed out before a public transcript path succeeded." }),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(AttemptError { label: "all", message: "Timed out before a public transcript path succeeded.".to_string() }),
     };
-
     match extraction {
         Ok(out) => {
             let server_ms = overall.elapsed().as_secs_f64() * 1000.0;
@@ -123,29 +132,41 @@ async fn handler(req: Request) -> Result<Value, Error> {
                 "ok": true,
                 "video": out.video,
                 "language": out.language,
-                "transcript": {"text": text, "segments": out.segments},
+                "transcript": { "text": text, "segments": out.segments },
                 "meta": {
                     "version": "arix-youtube-transcript-1.0.0",
                     "method": out.method,
                     "segmentCount": segment_count,
-                    "wordCount": word_count,
                     "charCount": text.chars().count(),
+                    "wordCount": word_count,
                     "serverMs": server_ms,
                     "acquisitionMs": out.acquisition_ms
                 }
             });
             let bytes = serde_json::to_vec(&payload).unwrap_or_default();
             if bytes.len() > MAX_RESPONSE_BYTES {
-                return Ok(error_json("OUTPUT_TOO_LARGE", "The transcript is larger than the serverless response safety limit. Use a shorter video or a chunked API design."));
+                return error_response("OUTPUT_TOO_LARGE", "The transcript is larger than the serverless response safety limit. Use a shorter video or a chunked API design.");
             }
-            Ok(payload)
+            json_response(200, &payload)
         }
-        Err(e) => Ok(error_json("TRANSCRIPT_UNAVAILABLE", &format!("{}: {}", e.label, e.message))),
+        Err(e) => error_response("TRANSCRIPT_UNAVAILABLE", &format!("{}: {}", e.label, e.message)),
     }
 }
 
-fn error_json(code: &str, message: &str) -> Value {
-    json!({"ok": false, "error": {"code": code, "message": message}})
+fn json_response(status: u16, value: &Value) -> Result<VercelResponse<ResponseBody>, Error> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(VercelResponse::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .header("cache-control", "no-store")
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "POST, OPTIONS")
+        .header("access-control-allow-headers", "content-type")
+        .body(ResponseBody::from(bytes))?)
+}
+
+fn error_response(code: &str, message: &str) -> Result<VercelResponse<ResponseBody>, Error> {
+    json_response(200, &json!({"ok": false, "error": {"code": code, "message": message}}))
 }
 
 fn make_client() -> Result<Client, reqwest::Error> {
@@ -192,13 +213,13 @@ fn extract_video_id(raw: &str) -> Result<String, String> {
     if !allowed_host(host) { return Err("Only youtube.com and youtu.be URLs are accepted.".into()); }
     let path = url.path().trim_matches('/');
     let id = if host.ends_with("youtu.be") {
-        path.split('/').next().unwrap_or("")
+        path.split('/').next().unwrap_or("").to_string()
     } else if path == "watch" {
-        url.query_pairs().find_map(|(k,v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default().as_str().to_string()
+        url.query_pairs().find_map(|(k, v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default()
     } else if path.starts_with("shorts/") || path.starts_with("embed/") || path.starts_with("live/") {
         path.split('/').nth(1).unwrap_or("").to_string()
     } else {
-        url.query_pairs().find_map(|(k,v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default()
+        url.query_pairs().find_map(|(k, v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default()
     };
     if Regex::new(r"^[A-Za-z0-9_-]{11}$").unwrap().is_match(&id) { Ok(id) } else { Err("Could not find a valid 11-character YouTube video ID.".into()) }
 }
@@ -264,7 +285,17 @@ async fn inner_tube_attempt_inner(client: Client, id: String, lang: Option<Strin
     let selected = choose_track(&tracks, lang.as_deref());
     let (segments, fmt) = fetch_track_any_format(&client, &selected).await.map_err(|e| ae(client_name, e))?;
     let segments = finalize_segments(segments).map_err(|e| ae(client_name, e))?;
-    Ok(Extraction { video, language: LanguageInfo { code: selected.language_code, name: selected.language_name, generated: selected.generated }, segments, method: format!("innertube-{client_name}-{fmt}"), acquisition_ms: 0.0 })
+    Ok(Extraction {
+        video,
+        language: LanguageInfo {
+            code: selected.language_code.clone(),
+            name: selected.language_name.clone(),
+            generated: selected.generated,
+        },
+        segments,
+        method: format!("innertube-{client_name}-{fmt}"),
+        acquisition_ms: 0.0,
+    })
 }
 
 fn ae(label: &'static str, message: impl Into<String>) -> AttemptError { AttemptError { label, message: message.into() } }
@@ -348,7 +379,7 @@ async fn fetch_track_any_format(client: &Client, track: &CaptionTrack) -> Result
     let formats = ["json3", "vtt", "srv1"];
     let mut jobs: Vec<BoxFuture<'static, Result<(Vec<Segment>, &'static str), String>>> = Vec::with_capacity(formats.len());
     for fmt in formats { jobs.push(fetch_one_format(client.clone(), track.base_url.clone(), fmt).boxed()); }
-    select_ok(jobs).await.map(|(v, _)| v).map_err(|errs| errs.into_iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" | "))
+    select_ok(jobs).await.map(|(v, _)| v)
 }
 
 async fn fetch_one_format(client: Client, base_url: String, fmt: &'static str) -> Result<(Vec<Segment>, &'static str), String> {
