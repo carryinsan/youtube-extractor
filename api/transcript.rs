@@ -3,11 +3,10 @@ use regex::Regex;
 use reqwest::{redirect::Policy, Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use http_body_util::BodyExt;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
 use url::Url;
-use vercel_runtime::{run, service_fn, Error, Request, Response as VercelResponse, ResponseBody};
+use vercel_runtime::{run, Error, Request};
 
 const MAX_BODY: usize = 6 * 1024 * 1024;
 const MAX_HTML: usize = 4 * 1024 * 1024;
@@ -75,53 +74,53 @@ struct CaptionTrack {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    run(service_fn(handler)).await
+    run(handler).await
 }
 
-async fn handler(req: Request) -> Result<VercelResponse<ResponseBody>, Error> {
-    if req.method().as_str() == "OPTIONS" {
-        return Ok(VercelResponse::builder()
-            .status(204)
-            .header("access-control-allow-origin", "*")
-            .header("access-control-allow-methods", "POST, OPTIONS")
-            .header("access-control-allow-headers", "content-type")
-            .body(ResponseBody::from(Vec::new()))?);
-    }
+async fn handler(req: Request) -> Result<Value, Error> {
     if req.method().as_str() != "POST" {
-        return error_response("METHOD_NOT_ALLOWED", "Use POST.");
+        return Ok(json!({"ok": false, "error": {"code": "METHOD_NOT_ALLOWED", "message": "Use POST."}}));
     }
-    let body = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return error_response("READ_FAILED", "Could not read request body."),
-    };
-    if body.len() > 16 * 1024 {
-        return error_response("REQUEST_TOO_LARGE", "Request body is limited to 16 KB.");
+    if req.body().len() > 16 * 1024 {
+        return Ok(error_json("REQUEST_TOO_LARGE", "Request body is limited to 16 KB."));
     }
-    let input: Input = match serde_json::from_slice(&body) {
+    let input: Input = match serde_json::from_slice(req.body()) {
         Ok(v) => v,
-        Err(_) => return error_response("INVALID_JSON", "Request body must be JSON like {\"url\":\"https://youtu.be/...\"}."),
+        Err(_) => return Ok(error_json("INVALID_JSON", "Request body must be JSON like {\"url\":\"https://youtu.be/...\"}.")),
     };
     let id = match extract_video_id(&input.url) {
         Ok(v) => v,
-        Err(msg) => return error_response("INVALID_YOUTUBE_URL", &msg),
+        Err(msg) => return Ok(error_json("INVALID_YOUTUBE_URL", &msg)),
     };
+
     let overall = Instant::now();
     let client = match make_client() {
         Ok(v) => v,
-        Err(e) => return error_response("CLIENT_INIT_FAILED", &e.to_string()),
+        Err(e) => return Ok(error_json("CLIENT_INIT_FAILED", &e.to_string())),
     };
     let lang = input.lang.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let mut attempts: Vec<BoxFuture<'static, AttemptResult>> = Vec::with_capacity(4);
-    attempts.push(watch_attempt(client.clone(), id.clone(), lang.map(str::to_string)).boxed());
+
+    // IMPORTANT: never fetch /watch. That endpoint is the common source of
+    // "verification/challenge" pages. Use YouTube's structured Innertube
+    // endpoints directly and race independent public client profiles.
+    let mut attempts: Vec<BoxFuture<'static, AttemptResult>> = Vec::with_capacity(6);
     attempts.push(inner_tube_attempt(client.clone(), id.clone(), lang.map(str::to_string), "ANDROID").boxed());
     attempts.push(inner_tube_attempt(client.clone(), id.clone(), lang.map(str::to_string), "IOS").boxed());
     attempts.push(inner_tube_attempt(client.clone(), id.clone(), lang.map(str::to_string), "TVHTML5").boxed());
+    attempts.push(next_transcript_attempt(client.clone(), id.clone(), lang.map(str::to_string), "ANDROID").boxed());
+    attempts.push(next_transcript_attempt(client.clone(), id.clone(), lang.map(str::to_string), "IOS").boxed());
+    attempts.push(next_transcript_attempt(client.clone(), id.clone(), lang.map(str::to_string), "TVHTML5").boxed());
+
     let joined = select_ok(attempts);
     let extraction: AttemptResult = match timeout(Duration::from_secs(24), joined).await {
         Ok(Ok((value, _remaining))) => Ok(value),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(AttemptError { label: "all", message: "Timed out before a public transcript path succeeded.".to_string() }),
+        Ok(Err(errors)) => Err(AttemptError {
+            label: "youtube",
+            message: errors.into_iter().take(6).map(|e| format!("{}: {}", e.label, e.message)).collect::<Vec<_>>().join(" | ")
+        }),
+        Err(_) => Err(AttemptError { label: "all", message: "Timed out before a public transcript path succeeded." }),
     };
+
     match extraction {
         Ok(out) => {
             let server_ms = overall.elapsed().as_secs_f64() * 1000.0;
@@ -132,41 +131,29 @@ async fn handler(req: Request) -> Result<VercelResponse<ResponseBody>, Error> {
                 "ok": true,
                 "video": out.video,
                 "language": out.language,
-                "transcript": { "text": text, "segments": out.segments },
+                "transcript": {"text": text, "segments": out.segments},
                 "meta": {
                     "version": "arix-youtube-transcript-1.0.0",
                     "method": out.method,
                     "segmentCount": segment_count,
-                    "charCount": text.chars().count(),
                     "wordCount": word_count,
+                    "charCount": text.chars().count(),
                     "serverMs": server_ms,
                     "acquisitionMs": out.acquisition_ms
                 }
             });
             let bytes = serde_json::to_vec(&payload).unwrap_or_default();
             if bytes.len() > MAX_RESPONSE_BYTES {
-                return error_response("OUTPUT_TOO_LARGE", "The transcript is larger than the serverless response safety limit. Use a shorter video or a chunked API design.");
+                return Ok(error_json("OUTPUT_TOO_LARGE", "The transcript is larger than the serverless response safety limit. Use a shorter video or a chunked API design."));
             }
-            json_response(200, &payload)
+            Ok(payload)
         }
-        Err(e) => error_response("TRANSCRIPT_UNAVAILABLE", &format!("{}: {}", e.label, e.message)),
+        Err(e) => Ok(error_json("TRANSCRIPT_UNAVAILABLE", &format!("{}: {}", e.label, e.message))),
     }
 }
 
-fn json_response(status: u16, value: &Value) -> Result<VercelResponse<ResponseBody>, Error> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok(VercelResponse::builder()
-        .status(status)
-        .header("content-type", "application/json; charset=utf-8")
-        .header("cache-control", "no-store")
-        .header("access-control-allow-origin", "*")
-        .header("access-control-allow-methods", "POST, OPTIONS")
-        .header("access-control-allow-headers", "content-type")
-        .body(ResponseBody::from(bytes))?)
-}
-
-fn error_response(code: &str, message: &str) -> Result<VercelResponse<ResponseBody>, Error> {
-    json_response(200, &json!({"ok": false, "error": {"code": code, "message": message}}))
+fn error_json(code: &str, message: &str) -> Value {
+    json!({"ok": false, "error": {"code": code, "message": message}})
 }
 
 fn make_client() -> Result<Client, reqwest::Error> {
@@ -213,51 +200,56 @@ fn extract_video_id(raw: &str) -> Result<String, String> {
     if !allowed_host(host) { return Err("Only youtube.com and youtu.be URLs are accepted.".into()); }
     let path = url.path().trim_matches('/');
     let id = if host.ends_with("youtu.be") {
-        path.split('/').next().unwrap_or("").to_string()
+        path.split('/').next().unwrap_or("")
     } else if path == "watch" {
-        url.query_pairs().find_map(|(k, v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default()
+        url.query_pairs().find_map(|(k,v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default().as_str().to_string()
     } else if path.starts_with("shorts/") || path.starts_with("embed/") || path.starts_with("live/") {
         path.split('/').nth(1).unwrap_or("").to_string()
     } else {
-        url.query_pairs().find_map(|(k, v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default()
+        url.query_pairs().find_map(|(k,v)| if k == "v" { Some(v.into_owned()) } else { None }).unwrap_or_default()
     };
     if Regex::new(r"^[A-Za-z0-9_-]{11}$").unwrap().is_match(&id) { Ok(id) } else { Err("Could not find a valid 11-character YouTube video ID.".into()) }
 }
 
-async fn watch_attempt(client: Client, id: String, lang: Option<String>) -> AttemptResult {
-    match timeout(Duration::from_secs(ATTEMPT_TIMEOUT_SECS), watch_attempt_inner(client, id.clone(), lang)).await {
+async fn next_transcript_attempt(client: Client, id: String, lang: Option<String>, client_name: &'static str) -> AttemptResult {
+    let started = Instant::now();
+    let result = timeout(Duration::from_secs(ATTEMPT_TIMEOUT_SECS), next_transcript_attempt_inner(client, id.clone(), lang, client_name)).await;
+    match result {
         Ok(v) => v,
-        Err(_) => Err(AttemptError { label: "watch", message: "watch-page path timed out.".into() }),
-    }
+        Err(_) => Err(AttemptError { label: client_name, message: "YouTube transcript endpoint timed out.".into() }),
+    }.map(|mut out| { out.acquisition_ms = started.elapsed().as_secs_f64()*1000.0; out })
 }
 
-async fn watch_attempt_inner(client: Client, id: String, lang: Option<String>) -> AttemptResult {
-    let started = Instant::now();
-    let watch_url = format!("https://www.youtube.com/watch?v={id}");
-    let html = fetch_text(&client, &watch_url, MAX_HTML).await.map_err(|e| ae("watch", e))?;
-    if looks_like_challenge(&html) { return Err(ae("watch", "YouTube returned a verification or challenge page.")); }
-    let player = extract_json_object_after_key(&html, "ytInitialPlayerResponse").ok_or_else(|| ae("watch", "Player metadata was not present."))?;
-    let video = parse_video(&player, &id, &watch_url);
-    assert_playable(&player)?;
-    let tracks = extract_tracks(&player);
-    if tracks.is_empty() {
-        if let Some(track) = fetch_searchable_transcript(&client, &html, &id, lang.as_deref()).await.map_err(|e| ae("watch-search", e))? {
-            return Ok(Extraction { video, language: track.0, segments: track.1, method: "watch-next-get_transcript".into(), acquisition_ms: started.elapsed().as_secs_f64()*1000.0 });
-        }
-        return Err(ae("watch", "No caption tracks were advertised by YouTube."));
-    }
-    let selected = choose_track(&tracks, lang.as_deref());
-    let direct_error = match fetch_track_any_format(&client, selected).await {
-        Ok((segments, fmt)) => {
-            let segments = finalize_segments(segments).map_err(|e| ae("watch-caption", e))?;
-            return Ok(Extraction { video, language: LanguageInfo { code: selected.language_code.clone(), name: selected.language_name.clone(), generated: selected.generated }, segments, method: format!("watch-{fmt}"), acquisition_ms: started.elapsed().as_secs_f64()*1000.0 });
-        }
-        Err(e) => e,
+async fn next_transcript_attempt_inner(client: Client, id: String, lang: Option<String>, client_name: &'static str) -> AttemptResult {
+    let (name, version, platform) = match client_name {
+        "ANDROID" => ("ANDROID", "20.10.38", "MOBILE"),
+        "IOS" => ("IOS", "21.26.4", "MOBILE"),
+        _ => ("TVHTML5", "7.20260707.07.00", "TV"),
     };
-    if let Some(track) = fetch_searchable_transcript(&client, &html, &id, lang.as_deref()).await.map_err(|e| ae("watch-search", e))? {
-        return Ok(Extraction { video, language: track.0, segments: track.1, method: "watch-next-get_transcript".into(), acquisition_ms: started.elapsed().as_secs_f64()*1000.0 });
-    }
-    Err(ae("watch-caption", format!("Direct captions failed: {direct_error}")))
+    let context = json!({"client":{"clientName":name,"clientVersion":version,"platform":platform,"hl":"en","gl":"US"}});
+    let next = post_json(&client, "https://www.youtube.com/youtubei/v1/next?prettyPrint=false", json!({
+        "context": context,
+        "videoId": id,
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    })).await.map_err(|e| ae(client_name, e))?;
+
+    let params = find_transcript_params(&next).ok_or_else(|| ae(client_name, "YouTube /next returned no public transcript endpoint."))?;
+    let value = post_json(&client, "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false", json!({
+        "context": context,
+        "params": params
+    })).await.map_err(|e| ae(client_name, e))?;
+    let segments = parse_searchable_transcript(&value).ok_or_else(|| ae(client_name, "Transcript renderer could not be parsed."))?;
+    let segments = finalize_segments(segments).map_err(|e| ae(client_name, e))?;
+    let code = lang.unwrap_or_else(|| "und".into());
+    let video = parse_video(&next, &id, &format!("https://www.youtube.com/watch?v={id}"));
+    Ok(Extraction {
+        video,
+        language: LanguageInfo { code, name: "YouTube transcript".into(), generated: false },
+        segments,
+        method: format!("innertube-{client_name}-get_transcript"),
+        acquisition_ms: 0.0,
+    })
 }
 
 async fn inner_tube_attempt(client: Client, id: String, lang: Option<String>, client_name: &'static str) -> AttemptResult {
@@ -285,17 +277,7 @@ async fn inner_tube_attempt_inner(client: Client, id: String, lang: Option<Strin
     let selected = choose_track(&tracks, lang.as_deref());
     let (segments, fmt) = fetch_track_any_format(&client, &selected).await.map_err(|e| ae(client_name, e))?;
     let segments = finalize_segments(segments).map_err(|e| ae(client_name, e))?;
-    Ok(Extraction {
-        video,
-        language: LanguageInfo {
-            code: selected.language_code.clone(),
-            name: selected.language_name.clone(),
-            generated: selected.generated,
-        },
-        segments,
-        method: format!("innertube-{client_name}-{fmt}"),
-        acquisition_ms: 0.0,
-    })
+    Ok(Extraction { video, language: LanguageInfo { code: selected.language_code, name: selected.language_name, generated: selected.generated }, segments, method: format!("innertube-{client_name}-{fmt}"), acquisition_ms: 0.0 })
 }
 
 fn ae(label: &'static str, message: impl Into<String>) -> AttemptError { AttemptError { label, message: message.into() } }
@@ -379,7 +361,7 @@ async fn fetch_track_any_format(client: &Client, track: &CaptionTrack) -> Result
     let formats = ["json3", "vtt", "srv1"];
     let mut jobs: Vec<BoxFuture<'static, Result<(Vec<Segment>, &'static str), String>>> = Vec::with_capacity(formats.len());
     for fmt in formats { jobs.push(fetch_one_format(client.clone(), track.base_url.clone(), fmt).boxed()); }
-    select_ok(jobs).await.map(|(v, _)| v)
+    select_ok(jobs).await.map(|(v, _)| v).map_err(|errs| errs.into_iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" | "))
 }
 
 async fn fetch_one_format(client: Client, base_url: String, fmt: &'static str) -> Result<(Vec<Segment>, &'static str), String> {
@@ -489,40 +471,6 @@ fn to_srt(segments: &[Segment]) -> String {
 
 fn srt_time(x: f64) -> String {
     let ms = (x.max(0.0)*1000.0).round() as u64; let h = ms/3_600_000; let m = (ms%3_600_000)/60_000; let s=(ms%60_000)/1000; let z=ms%1000; format!("{h:02}:{m:02}:{s:02},{z:03}")
-}
-
-async fn fetch_searchable_transcript(client: &Client, html: &str, id: &str, lang: Option<&str>) -> Result<Option<(LanguageInfo, Vec<Segment>)>, String> {
-    let api_key = extract_config_string(html, "INNERTUBE_API_KEY"); let client_version = extract_config_string(html, "INNERTUBE_CLIENT_VERSION");
-    let (Some(key), Some(version)) = (api_key, client_version) else { return Ok(None); };
-    let context = json!({"client":{"clientName":"WEB","clientVersion":version,"hl":"en","gl":"US"}});
-    let next_url = format!("https://www.youtube.com/youtubei/v1/next?key={key}");
-    let next = post_json(client, &next_url, json!({"videoId":id,"context":context.clone()})).await?;
-    let Some(params) = find_transcript_params(&next) else { return Ok(None); };
-    let get_url = format!("https://www.youtube.com/youtubei/v1/get_transcript?key={key}");
-    let value = post_json(client, &get_url, json!({"context":context,"params":params})).await?;
-    let segments = parse_searchable_transcript(&value).ok_or_else(|| "YouTube transcript renderer could not be parsed.".to_string())?;
-    if segments.is_empty() { return Ok(None); }
-    let segments = finalize_segments(segments)?;
-    let code = lang.unwrap_or("en").to_string();
-    Ok(Some((LanguageInfo { code, name: "YouTube transcript".into(), generated: false }, segments)))
-}
-
-fn extract_config_string(html: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\""); let start = html.find(&needle)? + needle.len(); let rest = &html[start..]; let end = rest.find('"')?; Some(rest[..end].replace("\\u0026", "&"))
-}
-
-fn find_transcript_params(v: &Value) -> Option<String> {
-    match v {
-        Value::Object(map) => {
-            if let Some(endpoint) = map.get("getTranscriptEndpoint") {
-                if let Some(params) = endpoint.get("params").and_then(Value::as_str) { return Some(params.to_string()); }
-            }
-            for child in map.values() { if let Some(x) = find_transcript_params(child) { return Some(x); } }
-        }
-        Value::Array(arr) => for child in arr { if let Some(x) = find_transcript_params(child) { return Some(x); } },
-        _ => {}
-    }
-    None
 }
 
 fn parse_searchable_transcript(v: &Value) -> Option<Vec<Segment>> {
