@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "regions": ["bom1"],
+  "builds": [
+    {
+      "src": "api/transcript.rs",
+      "use": "@vercel/rust"
+    },
+    {
+      "src": "index.html",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "app.js",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/transcript",
+      "dest": "/api/transcript.rs"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/$1"
+    }
+  ]
+}
